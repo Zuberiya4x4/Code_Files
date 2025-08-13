@@ -1,0 +1,86 @@
+{
+  "file_name": "Border less img.png",
+  "tables_extracted": 1,
+  "extraction_type": "borderless_tables_image_enhanced_with_multiple_methods",
+  "tables": [
+    {
+      "table_id": "EnhancedBorderlessTable_1",
+      "table_type": "borderless",
+      "extraction_method": "Text Analysis",
+      "bbox": [
+        0,
+        0,
+        1129,
+        381
+      ],
+      "score": 15.892857142857142,
+      "column_data": {
+        "Quantity": [
+          "Z",
+          "5",
+          "1",
+          "1",
+          "10",
+          ""
+        ],
+        "Description": [
+          "Item",
+          "Item",
+          "Item",
+          "Item",
+          "Item",
+          ""
+        ],
+        "Column_3": [
+          "1",
+          "2",
+          "3",
+          "4",
+          "5",
+          ""
+        ],
+        "Unit": [
+          "9.95",
+          "20.00",
+          "19.95",
+          "123.00",
+          "99.95",
+          ""
+        ],
+        "Price": [
+          "",
+          "",
+          "",
+          "",
+          "",
+          "TOTAL"
+        ],
+        "Column_6": [
+          "",
+          "",
+          "",
+          "",
+          "",
+          "DUE"
+        ],
+        "Column_7": [
+          "",
+          "",
+          "",
+          "",
+          "",
+          "$1,262.35"
+        ],
+        "Total": [
+          "19.90",
+          "100.00",
+          "19.95",
+          "123.00",
+          "999.50",
+          ""
+        ]
+      }
+    }
+  ],
+  "success": true
+}

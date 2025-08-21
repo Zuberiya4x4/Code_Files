@@ -1,701 +1,893 @@
-#!/usr/bin/env python3
-"""
-Template-Agnostic PDF and Image Processing Module
-Contains core functionality for processing PDFs and images
-"""
-import json
-import os
-import glob
-import pandas as pd
-from datetime import datetime
-import pdfplumber
-import logging
-from typing import Dict, List, Tuple, Any, Optional
-import traceback
-import fitz  # PyMuPDF for PDF to image conversion
-import pytesseract  # OCR for image-based PDFs and images
-from PIL import Image
-import io
+# document_processor.py
+
+import fitz  # PyMuPDF
+import pytesseract
+from pytesseract import Output
 import re
+import json
+from PIL import Image, ImageDraw, ImageFont
+import numpy as np
 
-# Get logger instance
-logger = logging.getLogger(__name__)
+# Configuration
+DEFAULT_HEAD_KEYS = {
+    "Advice sending date": "advice_date",
+    "Advice reference no": "advice_ref",
+    "Recipient's name and contact information": "receipt_name",
+    "Transaction type": "transaction_type",
+    "Sub payment type": "sub_payment_type",
+    "Beneficiary's name": "beneficiary_name",
+    "Beneficiary's bank": "beneficiary_bank",
+    "Beneficiary's account": "account_number",
+    "Customer reference": "customer_reference",
+    "Debit amount": "debit_amount",
+    "Remittance amount": "remittance_amount",
+    "Handling fee of remitting bank": "handling_fee_of_remitting_bank",
+    "Value date": "value_date",
+    "Remitter's name": "remitter_name",
+    "Remitting bank": "remitting_bank",
+    "Instruction reference": "instruction_reference",
+    "Other reference": "other_reference",
+    "Remitter to beneficiary information": "remitter_to_beneficiary_info"
+}
 
-def is_image_file(file_path):
-    """Check if the file is an image based on its extension"""
-    image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.gif', '.webp']
-    return any(file_path.lower().endswith(ext) for ext in image_extensions)
+DEFAULT_FIELD_TYPES = {
+    "advice_date": "date",
+    "advice_ref": "reference",
+    "receipt_name": "split_text",
+    "transaction_type": "text",
+    "sub_payment_type": "text",
+    "beneficiary_name": "text",
+    "beneficiary_bank": "text",
+    "account_number": "alphanumeric",
+    "customer_reference": "text",
+    "debit_amount": "amount",
+    "remittance_amount": "amount",
+    "handling_fee_of_remitting_bank": "text",
+    "value_date": "date",
+    "remitter_name": "text",
+    "remitting_bank": "text",
+    "instruction_reference": "text",
+    "other_reference": "text",
+    "remitter_to_beneficiary_info": "text"
+}
 
-def clean_text(text):
-    """Clean up extracted text by removing extra spaces and newlines"""
-    if not text:
-        return ""
-    # Replace multiple spaces with a single space and clean up
-    text = re.sub(r'\s+', ' ', text.strip())
-    return text
+DEFAULT_MAX_LEN = 30
 
-def extract_text_from_pdf_region(pdf_path, page_num, crop_coords=None):
-    """Extract text from a specific region of a PDF page"""
-    try:
-        with pdfplumber.open(pdf_path) as pdf:
-            if page_num >= len(pdf.pages):
-                logger.warning(f"Page {page_num + 1} not found in PDF")
-                return ""
-            
-            page = pdf.pages[page_num]
-            if crop_coords:
-                x1, y1, x2, y2 = crop_coords
-                # Ensure coordinates are within page bounds
-                page_width = page.width
-                page_height = page.height
-                x1 = max(0, min(x1, page_width))
-                y1 = max(0, min(y1, page_height))
-                x2 = max(x1, min(x2, page_width))
-                y2 = max(y1, min(y2, page_height))
-                
-                bbox = (x1, y1, x2, y2)
-                page = page.crop(bbox)
-            
-            text = page.extract_text()
-            return clean_text(text) if text else ""
-    except Exception as e:
-        logger.error(f"Error extracting text from PDF: {e}")
-        return ""
+DEFAULT_FIELD_COLORS = {
+    "advice_date": (255, 0, 0),
+    "advice_ref": (0, 255, 0),
+    "receipt_name": (0, 0, 255),
+    "transaction_type": (255, 165, 0),
+    "sub_payment_type": (255, 0, 255),
+    "beneficiary_name": (0, 255, 255),
+    "beneficiary_bank": (128, 0, 128),
+    "account_number": (255, 192, 203),
+    "customer_reference": (0, 128, 0),
+    "debit_amount": (255, 215, 0),
+    "remittance_amount": (230, 230, 250),
+    "handling_fee_of_remitting_bank": (255, 69, 0),
+    "value_date": (135, 206, 235),
+    "remitter_name": (238, 130, 238),
+    "remitting_bank": (34, 139, 34),
+    "instruction_reference": (255, 218, 185),
+    "other_reference": (75, 0, 130),
+    "remitter_to_beneficiary_info": (154, 205, 50),
+}
 
-def extract_text_from_image_region(pdf_path, page_num, crop_coords=None, dpi=300):
-    """Extract text from a specific region of a PDF page using OCR"""
-    try:
-        # Open PDF
-        doc = fitz.open(pdf_path)
-        if page_num >= len(doc):
-            logger.warning(f"Page {page_num + 1} not found in PDF")
-            doc.close()
-            return ""
+# Text extraction functions
+def extract_text_with_coordinates(file_path, file_type="pdf"):
+    """Extract text with coordinates from PDF or Image"""
+    words_with_coords = []
+    
+    if file_type == "pdf":
+        doc = fitz.open(file_path)
         
-        page = doc[page_num]
-        
-        # Convert page to image with higher DPI for better OCR
-        zoom = dpi / 72
-        mat = fitz.Matrix(zoom, zoom)
-        pix = page.get_pixmap(matrix=mat)
-        img_data = pix.tobytes("png")
-        img = Image.open(io.BytesIO(img_data))
-        
-        # Crop image if coordinates provided
-        if crop_coords:
-            x1, y1, x2, y2 = crop_coords
-            # Convert PDF coordinates to image coordinates
-            img_width, img_height = img.size
-            pdf_width = page.rect.width
-            pdf_height = page.rect.height
+        for page_num, page in enumerate(doc):
+            words = page.get_text("words")
             
-            # Scale coordinates
-            x1_img = int(x1 * img_width / pdf_width)
-            y1_img = int(y1 * img_height / pdf_height)
-            x2_img = int(x2 * img_width / pdf_width)
-            y2_img = int(y2 * img_height / pdf_height)
-            
-            # Ensure crop coordinates are within image bounds
-            x1_img = max(0, min(x1_img, img_width))
-            y1_img = max(0, min(y1_img, img_height))
-            x2_img = max(x1_img, min(x2_img, img_width))
-            y2_img = max(y1_img, min(y2_img, img_height))
-            
-            img = img.crop((x1_img, y1_img, x2_img, y2_img))
+            for word_info in words:
+                x0, y0, x1, y1, word, block_no, line_no, word_no = word_info
+                words_with_coords.append({
+                    "word": word,
+                    "x0": x0,
+                    "y0": y0,
+                    "x1": x1,
+                    "y1": y1,
+                    "page": page_num,
+                    "block": block_no,
+                    "line": line_no,
+                    "word_no": word_no
+                })
         
-        # Extract text using OCR with custom config
-        custom_config = r'--oem 3 --psm 6 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz@.-/:() '
-        text = pytesseract.image_to_string(img, config=custom_config)
         doc.close()
-        return clean_text(text) if text else ""
-    except Exception as e:
-        logger.error(f"Error extracting text from image: {e}")
-        return ""
-
-def extract_text_from_image_region_direct(image_path, crop_coords=None):
-    """Extract text from a specific region of an image using OCR"""
-    try:
-        # Open image
-        img = Image.open(image_path)
-        
-        # Crop image if coordinates provided
-        if crop_coords:
-            x1, y1, x2, y2 = crop_coords
-            img_width, img_height = img.size
-            
-            # Ensure crop coordinates are within image bounds
-            x1 = max(0, min(x1, img_width))
-            y1 = max(0, min(y1, img_height))
-            x2 = max(x1, min(x2, img_width))
-            y2 = max(y1, min(y2, img_height))
-            
-            img = img.crop((x1, y1, x2, y2))
-        
-        # Extract text using OCR with custom config
-        custom_config = r'--oem 3 --psm 6 -c tessedit_char_whitelist=0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz@.-/:() '
-        text = pytesseract.image_to_string(img, config=custom_config)
-        return clean_text(text) if text else ""
-    except Exception as e:
-        logger.error(f"Error extracting text from image: {e}")
-        return ""
-
-class TemplateAgnosticProcessor:
-    def __init__(self, field_info_path: str):
-        """
-        Initialize the template-agnostic PDF and image processor
-        
-        Args:
-            field_info_path: Path to the JSON file containing field information and coordinates
-        """
-        self.field_info = self.load_field_info(field_info_path)
-        self.template_name = self.field_info.get('template_name', 'Unknown')
-        
-    def load_field_info(self, field_info_path: str) -> Dict:
-        """Load field information from JSON file"""
-        try:
-            with open(field_info_path, 'r', encoding='utf-8') as f:
-                field_info = json.load(f)
-            
-            logger.info(f"Successfully loaded field info for template: {field_info.get('template_name', 'Unknown')}")
-            logger.info(f"Template contains {len(field_info.get('fields', []))} fields")
-            return field_info
-        except Exception as e:
-            logger.error(f"Error loading field info: {e}")
-            raise
     
-    def convert_coordinates(self, coords: Dict) -> Tuple[float, float, float, float]:
-        """
-        Convert coordinates from JSON format to (x1, y1, x2, y2) format
+    elif file_type == "image":
+        img = Image.open(file_path)
+        ocr_data = pytesseract.image_to_data(img, output_type=Output.DICT)
         
-        Args:
-            coords: Coordinates in JSON format (x, y, width, height)
-            
-        Returns:
-            Coordinates in (x1, y1, x2, y2) format
-        """
-        x = coords.get('x', 0)
-        y = coords.get('y', 0)
-        width = coords.get('width', 0)
-        height = coords.get('height', 0)
-        
-        # Convert to (x1, y1, x2, y2) format
-        x1 = x
-        y1 = y
-        x2 = x + width
-        y2 = y + height
-        
-        return (x1, y1, x2, y2)
-    
-    def extract_specific_value(self, raw_text: str, trigger_word: str = None, field_name: str = "") -> str:
-        """
-        Extract specific value from raw text using trigger words and patterns
-        
-        Args:
-            raw_text: Raw extracted text
-            trigger_word: Trigger word to look for
-            field_name: Field name for context-specific extraction
-            
-        Returns:
-            Cleaned specific value
-        """
-        if not raw_text:
-            return ""
-        
-        text = clean_text(raw_text)
-        logger.debug(f"Processing field '{field_name}' with raw text: '{text[:100]}...'")
-        
-        # If we have a trigger word, extract text after it
-        if trigger_word:
-            trigger_clean = clean_text(trigger_word)
-            
-            # Look for trigger word in the text
-            trigger_pos = text.lower().find(trigger_clean.lower())
-            if trigger_pos != -1:
-                # Get text after the trigger word
-                after_trigger = text[trigger_pos + len(trigger_clean):].strip()
-                # Remove common separators
-                after_trigger = re.sub(r'^[:.\-\s]+', '', after_trigger).strip()
-                if after_trigger:
-                    text = after_trigger
-                    logger.debug(f"After trigger word extraction: '{text[:50]}...'")
-        
-        # Field-specific value extraction patterns
-        if field_name.lower() in ['advice_date', 'value_date']:
-            # Extract date patterns
-            date_pattern = r'\b\d{1,2}\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4}\b'
-            match = re.search(date_pattern, text, re.IGNORECASE)
-            if match:
-                return match.group().strip()
-        
-        elif field_name.lower() == 'advice_ref':
-            # Specific pattern for advice reference - look for the reference after "reference no:"
-            ref_patterns = [
-                r'(?:reference\s+no[:.]?\s*)?([A-Z0-9]+-IN)\b',  # Pattern like A2cg67fZPXxK-IN
-                r'([A-Z0-9]{8,}-IN)\b',                          # Alphanumeric followed by -IN
-                r'([A-Z0-9]{10,20})\s*Payment\s*Advice',        # Reference before "Payment Advice"
-                r'([A-Z0-9]{8,20})\b'                           # General alphanumeric pattern
-            ]
-            for pattern in ref_patterns:
-                match = re.search(pattern, text, re.IGNORECASE)
-                if match:
-                    ref = match.group(1) if match.groups() else match.group()
-                    if ref and ref.lower() not in ['payment', 'advice', 'page', 'jpmorgan']:
-                        return ref.strip()
-        
-        elif field_name.lower() in ['instruction_reference', 'other_reference']:
-            # Different patterns for different reference types
-            if field_name.lower() == 'instruction_reference':
-                # Look for alphanumeric codes like 90012BZ6EFR5
-                ref_patterns = [
-                    r'\b([A-Z0-9]{10,15})\b',
-                    r'\b(\d{5}[A-Z0-9]{5,10})\b'
-                ]
-            else:  # other_reference
-                # Look for HSBC reference patterns like HSBCN24285996982
-                ref_patterns = [
-                    r'\b(HSBC[A-Z0-9]{10,15})\b',
-                    r'\b([A-Z]{4,6}\d{8,15})\b'
-                ]
-            
-            for pattern in ref_patterns:
-                match = re.search(pattern, text, re.IGNORECASE)
-                if match:
-                    ref = match.group(1).strip()
-                    # Avoid duplicates between instruction and other reference
-                    if field_name.lower() == 'other_reference' and not ref.startswith(('HSBC', 'hsbc')):
-                        continue
-                    if field_name.lower() == 'instruction_reference' and ref.startswith(('HSBC', 'hsbc')):
-                        continue
-                    return ref
-        
-        elif field_name.lower() == 'customer_reference':
-            # Look for numeric references
-            ref_match = re.search(r'\b(\d{5,10})\b', text)
-            if ref_match:
-                return ref_match.group(1).strip()
-        
-        elif field_name.lower() in ['debit_amount', 'remittance_amount']:
-            # Extract currency amounts
-            amount_patterns = [
-                r'(INR\s*[\d,]+\.?\d*)',
-                r'(USD\s*[\d,]+\.?\d*)',
-                r'(EUR\s*[\d,]+\.?\d*)',
-                r'([\d,]+\.?\d*)\s*INR',
-            ]
-            for pattern in amount_patterns:
-                match = re.search(pattern, text, re.IGNORECASE)
-                if match:
-                    return match.group(1).strip()
-        
-        elif field_name.lower() in ['receipt_name', 'beneficiary_name', 'remitter_name']:
-            # Extract company/person names
-            # Remove email addresses first
-            text_no_email = re.sub(r'\S+@\S+\.\S+', '', text)
-            
-            # Look for company name patterns
-            name_patterns = [
-                r'\b([A-Z][a-zA-Z\s&]+(?:Ltd|Pvt|Corp|Inc|Company|Services))\b',
-                r'\b([A-Z][A-Z\s]+[A-Z])\b',  # All caps names
-                r'\b([A-Z][a-zA-Z\s]+(?:\s[A-Z][a-zA-Z]+){1,3})\b'  # Title case names
-            ]
-            
-            for pattern in name_patterns:
-                matches = re.findall(pattern, text_no_email)
-                if matches:
-                    # Return the longest match
-                    longest_match = max(matches, key=len).strip()
-                    if len(longest_match) > 5:  # Reasonable name length
-                        return longest_match
-        
-        elif field_name.lower() == 'receipt_email':
-            # Extract email addresses
-            email_match = re.search(r'\b([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,})\b', text)
-            if email_match:
-                return email_match.group(1).strip()
-        
-        elif field_name.lower() == 'account_number':
-            # Extract account numbers - look for CIFS pattern specifically
-            account_patterns = [
-                r'\b(CIFS\d+[X\*]+)\b',     # Pattern like CIFS105X1*****
-                r'\b([A-Z]{4}\d+[X\*]+)\b', # General pattern like above
-                r'\b(\d{8,20})\b',          # Numeric account numbers
-            ]
-            for pattern in account_patterns:
-                match = re.search(pattern, text)
-                if match:
-                    return match.group(1).strip()
-        
-        elif field_name.lower() == 'beneficiary_bank':
-            # Extract bank names - prioritize specific bank names
-            bank_patterns = [
-                r'\b(JPMORGAN\s+CHASE\s+BANK(?:\s+[A-Z]+)?)\b',  # JPMORGAN CHASE BANK
-                r'\b([A-Z][A-Za-z\s]*BANK[A-Za-z\s]*)\b',       # Other bank patterns
-                r'\b(HSBC(?:\s+[A-Za-z]+)*)\b',                 # HSBC variations
-            ]
-            for pattern in bank_patterns:
-                match = re.search(pattern, text, re.IGNORECASE)
-                if match:
-                    bank_name = match.group(1).strip()
-                    # Clean up bank name
-                    if 'JPMORGAN' in bank_name.upper():
-                        return 'JPMORGAN CHASE BANK'
-                    return bank_name
-        
-        elif field_name.lower() == 'remitting_bank':
-            # Extract remitting bank names
-            bank_patterns = [
-                r'\b(HK\s+and\s+Shanghai\s+Banking\s+Corp\s+Ltd)\b',  # Full HSBC name
-                r'\b(HSBC(?:\s+[A-Za-z]+)*)\b',                       # HSBC variations
-                r'\b([A-Z][A-Za-z\s]*Bank(?:ing)?\s+Corp(?:oration)?[A-Za-z\s]*)\b',
-                r'\b([A-Z][A-Za-z\s]+BANK[A-Za-z\s]*)\b',
-            ]
-            for pattern in bank_patterns:
-                match = re.search(pattern, text, re.IGNORECASE)
-                if match:
-                    bank_name = match.group(1).strip()
-                    # Clean up common bank name variations
-                    if 'HK and Shanghai' in bank_name or 'HSBC' in bank_name:
-                        return 'HK and Shanghai Banking Corp Ltd'
-                    return bank_name
-        
-        # Default: return the first meaningful part of the text
-        # Split by common delimiters and take the first substantial part
-        parts = re.split(r'[:\n\r]+', text)
-        for part in parts:
-            part = part.strip()
-            if len(part) > 2 and part.lower() not in ['page', 'recipient', 'name', 'information', 'advice', 'payment']:
-                # Take first line if multi-line
-                first_line = part.split('\n')[0].strip()
-                if first_line:
-                    return first_line
-        
-        return text.split('\n')[0].strip()  # Return first line as fallback
-    
-    def extract_field_value(self, file_path: str, field_data: Dict) -> str:
-        """
-        Extract value from a specific field using coordinates
-        
-        Args:
-            file_path: Path to PDF or image file
-            field_data: Field information including coordinates
-            
-        Returns:
-            Extracted field value as string
-        """
-        try:
-            field_name = field_data.get('field_name', 'unknown')
-            trigger_word = field_data.get('trigger_word', '')
-            logger.debug(f"Extracting field: {field_name}")
-            
-            # Get value coordinates - prioritize value_coordinates, fallback to coordinates
-            value_coords = field_data.get('value_coordinates') or field_data.get('coordinates')
-            if not value_coords:
-                logger.error(f"No coordinates found for field: {field_name}")
-                return ""
-            
-            # Convert coordinates to proper format
-            crop_coords = self.convert_coordinates(value_coords)
-            
-            # Check if the file is an image
-            if is_image_file(file_path):
-                # For images, ignore page number and use direct image extraction
-                extracted_text = extract_text_from_image_region_direct(file_path, crop_coords)
-            else:
-                # For PDFs, get page number
-                page_num = value_coords.get('page', 1) - 1  # Convert to 0-indexed
-                # Try PDF text extraction first
-                extracted_text = extract_text_from_pdf_region(file_path, page_num, crop_coords)
+        for i in range(len(ocr_data['text'])):
+            if ocr_data['text'][i].strip():
+                x, y, w, h = ocr_data['left'][i], ocr_data['top'][i], ocr_data['width'][i], ocr_data['height'][i]
+                word = ocr_data['text'][i].strip()
                 
-                # If no text or minimal text, try OCR
-                if not extracted_text or len(extracted_text.strip()) < 2:
-                    logger.debug(f"PDF text extraction minimal for {field_name}, trying OCR")
-                    extracted_text = extract_text_from_image_region(file_path, page_num, crop_coords)
-            
-            # Extract specific value using intelligent parsing
-            result = self.extract_specific_value(extracted_text, trigger_word, field_name)
-            
-            logger.debug(f"Extracted value for {field_name}: '{result}'")
-            return result
-            
-        except Exception as e:
-            logger.error(f"Error extracting field '{field_data.get('field_name', 'unknown')}': {e}")
-            return ""
+                words_with_coords.append({
+                    "word": word,
+                    "x0": x,
+                    "y0": y,
+                    "x1": x + w,
+                    "y1": y + h,
+                    "page": 0,
+                    "block": ocr_data['block_num'][i],
+                    "line": ocr_data['line_num'][i],
+                    "word_no": ocr_data['word_num'][i]
+                })
     
-    def process_single_file(self, file_path: str) -> Dict:
-        """
-        Process a single PDF or image file using the loaded field information
-        
-        Args:
-            file_path: Path to PDF or image file
-            
-        Returns:
-            Dictionary with extraction results
-        """
-        logger.info(f"Processing file: {file_path}")
-        
-        # Initialize result structure
-        result = {
-            "source_file": os.path.basename(file_path),
-            "template_name": self.template_name,
-            "extraction_timestamp": datetime.now().isoformat(),
-            "extracted_data": {},
-            "processing_status": "in_progress"
+    return words_with_coords
+
+def tokenize_with_index(words_with_coords):
+    """Tokenize text and return list of (index, word_info) tuples"""
+    return [(i, word_info) for i, word_info in enumerate(words_with_coords)]
+
+# Entity detection functions
+def normalize(word):
+    """Normalize word by removing non-alphanumeric characters and converting to lowercase"""
+    return "".join(c for c in word if c.isalnum()).lower()
+
+def create_normalized_key_map(head_keys):
+    """Create a mapping of normalized keys to their original forms and labels"""
+    normalized_map = {}
+    for raw_key, label in head_keys.items():
+        normalized_words = [normalize(w) for w in raw_key.split()]
+        normalized_key = " ".join(normalized_words)
+        normalized_map[normalized_key] = {
+            "raw_key": raw_key,
+            "label": label,
+            "word_count": len(normalized_words)
         }
-        
-        try:
-            # Validate file
-            if is_image_file(file_path):
-                logger.info("Processing as image file")
-            elif file_path.lower().endswith('.pdf'):
-                with pdfplumber.open(file_path) as pdf:
-                    page_count = len(pdf.pages)
-                    logger.info(f"PDF has {page_count} pages")
-                if page_count == 0:
-                    raise Exception("PDF has no pages")
+    return normalized_map
+
+def find_entity_boundaries(indexed_words, head_keys):
+    """Find all entity positions and their boundaries using index-based approach"""
+    words = [w_info["word"] for _, w_info in indexed_words]
+    normalized_key_map = create_normalized_key_map(head_keys)
+    
+    key_matches = []
+    
+    for i in range(len(words)):
+        for key_length in range(6, 0, -1):
+            if i + key_length > len(words):
+                continue
+                
+            phrase_words = [normalize(words[i + j]) for j in range(key_length)]
+            normalized_phrase = " ".join(phrase_words)
+            exact_phrase = " ".join(words[i:i + key_length]).lower()
+            
+            matched_key = None
+            if normalized_phrase in normalized_key_map:
+                matched_key = normalized_key_map[normalized_phrase]
             else:
-                raise Exception("Unsupported file format")
+                for raw_key, label in head_keys.items():
+                    if raw_key.lower() == exact_phrase:
+                        matched_key = {
+                            "raw_key": raw_key,
+                            "label": label,
+                            "word_count": len(raw_key.split())
+                        }
+                        break
             
-            # Process each field in the template
-            fields = self.field_info.get('fields', [])
-            total_fields = len(fields)
-            successful_extractions = 0
+            if not matched_key and "recipient" in normalized_phrase and "name" in normalized_phrase:
+                if key_length >= 2:
+                    matched_key = {
+                        "raw_key": "Recipient's name",
+                        "label": "receipt_name",
+                        "word_count": 2
+                    }
             
-            logger.info(f"Processing {total_fields} fields from template")
-            
-            for i, field_data in enumerate(fields, 1):
-                field_name = field_data.get('field_name', f'field_{i}')
-                logger.info(f"Processing field {i}/{total_fields}: {field_name}")
+            if matched_key:
+                key_info = matched_key
                 
-                # Extract values for identified field names
-                extracted_value = self.extract_field_value(file_path, field_data)
+                is_duplicate = False
+                for existing_match in key_matches:
+                    if (existing_match["start_index"] <= i < existing_match["end_index"] or
+                        i <= existing_match["start_index"] < i + key_length):
+                        if key_length <= (existing_match["end_index"] - existing_match["start_index"]):
+                            is_duplicate = True
+                            break
+                        else:
+                            key_matches.remove(existing_match)
                 
-                # Create key-value pairs
-                if extracted_value:
-                    result["extracted_data"][field_name] = extracted_value
-                    successful_extractions += 1
-                    logger.info(f"✓ Successfully extracted '{field_name}': '{extracted_value[:50]}{'...' if len(extracted_value) > 50 else ''}'")
-                else:
-                    result["extracted_data"][field_name] = ""
-                    logger.warning(f"✗ Failed to extract '{field_name}'")
+                if not is_duplicate:
+                    key_matches.append({
+                        "start_index": i,
+                        "end_index": i + min(key_length, key_info["word_count"]),
+                        "raw_key": key_info["raw_key"],
+                        "label": key_info["label"],
+                        "normalized_key": normalized_phrase,
+                        "actual_words": " ".join(words[i:i + key_length])
+                    })
+                break
+    
+    key_matches.sort(key=lambda x: x["start_index"])
+    return key_matches
+
+def is_line_break_between(words_with_info, idx1, idx2):
+    """Check if there's a significant line break between two word indices"""
+    if idx1 >= len(words_with_info) or idx2 >= len(words_with_info) or idx1 >= idx2:
+        return False
+    
+    word1_info = words_with_info[idx1]
+    word2_info = words_with_info[idx2]
+    
+    if word1_info.get("line", 0) != word2_info.get("line", 0):
+        return True
+    
+    y_diff = abs(word2_info["y0"] - word1_info["y0"])
+    avg_height = (word1_info["y1"] - word1_info["y0"] + word2_info["y1"] - word2_info["y0"]) / 2
+    
+    if y_diff > avg_height * 1.5:
+        return True
+    
+    return False
+
+def find_next_key_boundary(current_index, key_matches_sorted, current_match_idx):
+    """Find the next key boundary, excluding certain close fields"""
+    next_boundary = float('inf')
+    
+    for j in range(current_match_idx + 1, len(key_matches_sorted)):
+        next_match = key_matches_sorted[j]
+        if next_match["start_index"] > current_index:
+            next_boundary = next_match["start_index"]
+            break
+    
+    return next_boundary
+
+def clean_field_value(label, value_words, all_words, start_idx, end_idx=None, all_matches=None, field_type="text"):
+    """Apply field-specific cleaning rules with improved logic based on field type"""
+    if not value_words:
+        return ""
+    
+    full_value = " ".join(value_words)
+    
+    if field_type == "reference":
+        for word in value_words:
+            if len(word) > 5 and any(c.isdigit() for c in word) and any(c.isalpha() for c in word):
+                return word
+        
+        for word in value_words:
+            if len(word) > 2 and word not in [":", "-", "–", "—", "|", "•"]:
+                return word
+        
+        return value_words[0] if value_words else ""
+    
+    elif field_type == "date":
+        date_words = []
+        for word in value_words:
+            if any(c.isdigit() for c in word) or word in ["Jan", "Feb", "Mar", "Apr", "May", "Jun", 
+                                                          "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]:
+                date_words.append(word)
+            elif len(date_words) > 0:
+                break
+        
+        if date_words:
+            return " ".join(date_words[:3])
+        
+        return " ".join(value_words[:2]) if value_words else ""
+    
+    elif field_type == "amount":
+        combined_text = " ".join(value_words)
+        
+        file_type = "pdf"  # Default to pdf for this function
+        
+        currency_pattern = r'(?:INR|USD|EUR|GBP|\$|£|€)\s*[\d,]+(?:\.\d+)?'
+        match = re.search(currency_pattern, combined_text, re.IGNORECASE)
+        if match:
+            return match.group(0).strip()
+        
+        amount_parts = []
+        found_currency = False
+        found_digits = False
+        
+        for j, word in enumerate(value_words):
+            if any(curr in word.upper() for curr in ["INR", "USD", "EUR", "GBP", "$", "£", "€"]):
+                amount_parts.append(word)
+                found_currency = True
+            elif found_currency:
+                if word.replace(",", "").replace(".", "").isdigit():
+                    amount_parts.append(word)
+                    found_digits = True
+                elif word in [",", "."] and found_digits:
+                    amount_parts.append(word)
+                elif found_digits and word not in [",", "."]:
+                    break
+        
+        if amount_parts:
+            return "".join(amount_parts).strip()
+        
+        for i, word in enumerate(value_words):
+            if any(curr in word.upper() for curr in ["INR", "USD", "EUR", "GBP", "$", "£", "€"]):
+                amount_words = [word]
+                for j in range(i+1, min(i+10, len(value_words))):
+                    next_word = value_words[j]
+                    if next_word.replace(",", "").replace(".", "").isdigit() or next_word in [",", "."]:
+                        amount_words.append(next_word)
+                    else:
+                        break
+                return "".join(amount_words).strip()
+        
+        for i, word in enumerate(value_words):
+            if any(curr in word.upper() for curr in ["INR", "USD", "EUR", "GBP"]):
+                number_parts = []
+                for j in range(i+1, min(i+10, len(value_words))):
+                    if value_words[j].replace(",", "").replace(".", "").isdigit():
+                        number_parts.append(value_words[j])
+                    elif value_words[j] in [",", "."] and number_parts:
+                        number_parts.append(value_words[j])
+                    elif number_parts:
+                        break
+                
+                if number_parts:
+                    return f"{word}{''.join(number_parts)}"
+        
+        inr_pattern = r'INR\s*[\d,]+(?:\.\d+)?'
+        match = re.search(inr_pattern, combined_text, re.IGNORECASE)
+        if match:
+            return match.group(0).strip()
+        
+        currency_pattern = r'[A-Z]{3}\s*[\d,]+(?:\.\d+)?'
+        match = re.search(currency_pattern, combined_text)
+        if match:
+            return match.group(0).strip()
+        
+        number_pattern = r'[\$£€¥]\s*[\d,]+(?:\.\d+)?'
+        match = re.search(number_pattern, combined_text)
+        if match:
+            return match.group(0).strip()
+        
+        digit_pattern = r'[\d,]+(?:\.\d+)?'
+        match = re.search(digit_pattern, combined_text)
+        if match:
+            amount_text = match.group(0).strip()
+            if len(amount_text) > 3:
+                return amount_text
+        
+        return " ".join(value_words[:5]).strip()
+    
+    elif field_type == "alphanumeric":
+        for word in value_words:
+            if len(word) > 6 and any(c.isdigit() for c in word) and any(c.isalpha() for c in word):
+                return word
+        
+        for word in value_words:
+            if len(word) > 6 and any(c.isdigit() for c in word):
+                return word
+        
+        return " ".join(value_words[:2]).strip()
+    
+    elif field_type == "split_text" and label == "receipt_name":
+        filtered_words = []
+        skip_words = ["and", "contact", "information:", "information"]
+        
+        for word in value_words:
+            if word.lower() not in skip_words:
+                filtered_words.append(word)
+        
+        company_words = []
+        email_found = False
+        
+        for word in filtered_words:
+            if word.lower() in ["page:", "page", "1/1", "/"]:
+                break
+                
+            if "@" in word or ".com" in word.lower() or ".co.in" in word.lower():
+                company_words.append(word)
+                email_found = True
+                break
+            else:
+                company_words.append(word)
+        
+        result = " ".join(company_words).strip()
+        result = result.replace(":", "").strip()
+        
+        return result
+    
+    else:
+        clean_words = []
+        for word in value_words:
+            if word not in [":", "-", "–", "—", "|", "•"] and len(word) > 0:
+                clean_words.append(word)
+            if len(clean_words) >= 5:
+                break
+        return " ".join(clean_words).strip()
+
+def merge_bounding_boxes(boxes):
+    """Merge multiple bounding boxes into one"""
+    if not boxes:
+        return None
+    
+    x0 = min(box[0] for box in boxes)
+    y0 = min(box[1] for box in boxes)
+    x1 = max(box[2] for box in boxes)
+    y1 = max(box[3] for box in boxes)
+    
+    return (x0, y0, x1, y1)
+
+def extract_entity_values(indexed_words, key_matches, field_types):
+    """Extract values for each entity using index boundaries with improved logic"""
+    words_with_info = [w_info for _, w_info in indexed_words]
+    words = [w_info["word"] for w_info in words_with_info]
+    results = {}
+    
+    key_matches_sorted = sorted(key_matches, key=lambda x: x["start_index"])
+    
+    for i, match in enumerate(key_matches_sorted):
+        start_idx = match["end_index"]
+        label = match["label"]
+        
+        field_type = field_types.get(label, "text")
+        
+        while start_idx < len(words) and words[start_idx] in [":", "-", "–", "—", "|", "•", ".", "and", "contact", "information"]:
+            start_idx += 1
+        
+        if field_type == "reference":
+            end_idx = start_idx + 5
+            next_boundary = find_next_key_boundary(start_idx, key_matches_sorted, i)
+            end_idx = min(end_idx, next_boundary)
             
-            # Add default receipt_email if not extracted and receipt_name contains email
-            if 'receipt_email' not in result["extracted_data"] or not result["extracted_data"]['receipt_email']:
-                receipt_name = result["extracted_data"].get('receipt_name', '')
-                email_match = re.search(r'\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Z|a-z]{2,}\b', receipt_name)
-                if email_match:
-                    result["extracted_data"]['receipt_email'] = email_match.group()
-                elif 'receipt_email' not in result["extracted_data"]:
-                    result["extracted_data"]['receipt_email'] = "AR.FS@compass-group.co.in"  # Default fallback
+            for j in range(start_idx + 1, min(start_idx + 5, len(words_with_info))):
+                if is_line_break_between(words_with_info, start_idx, j):
+                    end_idx = min(end_idx, j)
+                    break
+        
+        elif field_type == "date":
+            end_idx = start_idx + 4
+            next_boundary = find_next_key_boundary(start_idx, key_matches_sorted, i)
+            end_idx = min(end_idx, next_boundary)
+        
+        elif field_type == "amount":
+            end_idx = start_idx + 100
+            next_boundary = find_next_key_boundary(start_idx, key_matches_sorted, i)
+            end_idx = min(end_idx, next_boundary)
             
-            # Update processing status
-            result["processing_status"] = "completed"
-            result["extraction_summary"] = {
-                "total_fields": total_fields,
-                "successful_extractions": successful_extractions,
-                "failed_extractions": total_fields - successful_extractions,
-                "success_rate": f"{(successful_extractions/total_fields)*100:.1f}%" if total_fields > 0 else "0%"
+            file_type = "pdf"  # Default to pdf for this function
+            if file_type == 'image':
+                found_currency = False
+                for j in range(start_idx, min(end_idx, len(words))):
+                    word = words[j]
+                    if any(curr in word.upper() for curr in ["INR", "USD", "EUR", "GBP"]):
+                        found_currency = True
+                    elif found_currency and any(c.isdigit() for c in word):
+                        continue
+                    elif found_currency and word.strip() in [",", ".", ""]:
+                        continue
+                    elif found_currency:
+                        end_idx = min(end_idx, j)
+                        break
+        
+        elif field_type == "split_text":
+            end_idx = start_idx + 20
+            next_boundary = find_next_key_boundary(start_idx, key_matches_sorted, i)
+            end_idx = min(end_idx, next_boundary)
+            
+            for j in range(start_idx, min(end_idx, len(words))):
+                if (words[j].lower() in ["page:", "page", "1/1", "/"] or 
+                    ".com" in words[j].lower() or 
+                    ".co.in" in words[j].lower()):
+                    end_idx = j + 1
+                    break
+        
+        else:
+            end_idx = start_idx + DEFAULT_MAX_LEN
+            next_boundary = find_next_key_boundary(start_idx, key_matches_sorted, i)
+            end_idx = min(end_idx, next_boundary)
+        
+        value_words = []
+        value_indexes = []
+        
+        for j in range(start_idx, min(end_idx, len(words))):
+            value_words.append(words[j])
+            value_indexes.append(j)
+        
+        cleaned_value = clean_field_value(label, value_words, words, start_idx, end_idx, key_matches_sorted, field_type)
+        
+        actual_key_length = len(match["raw_key"].split())
+        key_word_infos = words_with_info[match["start_index"]:match["start_index"] + actual_key_length]
+        key_boxes = [(w["x0"], w["y0"], w["x1"], w["y1"]) for w in key_word_infos]
+        key_merged_box = merge_bounding_boxes(key_boxes)
+        key_page = key_word_infos[0]["page"] if key_word_infos else 0
+        
+        cleaned_value_words = cleaned_value.split() if cleaned_value else []
+        actual_value_indexes = []
+        
+        if field_type == "split_text" and label == "receipt_name":
+            value_parts = []
+            
+            email_match = re.search(r'\b[\w\.-]+@[\w\.-]+\.\w+\b', cleaned_value)
+            if email_match:
+                email = email_match.group(0)
+                company_name = cleaned_value[:email_match.start()].strip()
+                
+                company_words = company_name.split()
+                company_start_idx = None
+                company_end_idx = None
+                
+                for i in range(len(value_words) - len(company_words) + 1):
+                    if value_words[i:i+len(company_words)] == company_words:
+                        company_start_idx = value_indexes[i]
+                        company_end_idx = value_indexes[i+len(company_words)-1] + 1
+                        break
+                
+                email_start_idx = None
+                email_end_idx = None
+                for i in range(len(value_words)):
+                    if email in value_words[i]:
+                        email_start_idx = value_indexes[i]
+                        email_end_idx = value_indexes[i] + 1
+                        break
+                
+                if company_start_idx is not None and company_end_idx is not None:
+                    company_word_infos = [words_with_info[idx] for idx in range(company_start_idx, company_end_idx) if idx < len(words_with_info)]
+                    company_boxes = [(w["x0"], w["y0"], w["x1"], w["y1"]) for w in company_word_infos]
+                    company_merged_box = merge_bounding_boxes(company_boxes)
+                    company_page = company_word_infos[0]["page"] if company_word_infos else 0
+                    
+                    value_parts.append({
+                        "text": company_name,
+                        "coordinates": {
+                            "x": company_merged_box[0] if company_merged_box else 0,
+                            "y": company_merged_box[1] if company_merged_box else 0,
+                            "width": company_merged_box[2] - company_merged_box[0] if company_merged_box else 0,
+                            "height": company_merged_box[3] - company_merged_box[1] if company_merged_box else 0,
+                            "page": company_page + 1
+                        }
+                    })
+                
+                if email_start_idx is not None and email_end_idx is not None:
+                    email_word_infos = [words_with_info[idx] for idx in range(email_start_idx, email_end_idx) if idx < len(words_with_info)]
+                    email_boxes = [(w["x0"], w["y0"], w["x1"], w["y1"]) for w in email_word_infos]
+                    email_merged_box = merge_bounding_boxes(email_boxes)
+                    email_page = email_word_infos[0]["page"] if email_word_infos else 0
+                    
+                    value_parts.append({
+                        "text": email,
+                        "coordinates": {
+                            "x": email_merged_box[0] if email_merged_box else 0,
+                            "y": email_merged_box[1] if email_merged_box else 0,
+                            "width": email_merged_box[2] - email_merged_box[0] if email_merged_box else 0,
+                            "height": email_merged_box[3] - email_merged_box[1] if email_merged_box else 0,
+                            "page": email_page + 1
+                        }
+                    })
+                
+                if company_start_idx is not None and email_end_idx is not None:
+                    actual_value_indexes = list(range(company_start_idx, email_end_idx))
+            else:
+                if cleaned_value_words and value_indexes:
+                    cleaned_text = cleaned_value.lower().replace(",", "").replace(".", "")
+                    
+                    for j, idx in enumerate(value_indexes):
+                        if j < len(value_words):
+                            word = value_words[j].lower().replace(",", "").replace(".", "")
+                            if word in cleaned_text:
+                                actual_value_indexes.append(idx)
+                    
+                    if not actual_value_indexes and value_indexes:
+                        word_count = min(len(cleaned_value_words), len(value_indexes))
+                        actual_value_indexes = value_indexes[:word_count]
+        else:
+            if cleaned_value_words and value_indexes:
+                cleaned_text = cleaned_value.lower().replace(",", "").replace(".", "")
+                
+                for j, idx in enumerate(value_indexes):
+                    if j < len(value_words):
+                        word = value_words[j].lower().replace(",", "").replace(".", "")
+                        if word in cleaned_text:
+                            actual_value_indexes.append(idx)
+                
+                if not actual_value_indexes and value_indexes:
+                    word_count = min(len(cleaned_value_words), len(value_indexes))
+                    actual_value_indexes = value_indexes[:word_count]
+        
+        value_word_infos = [words_with_info[idx] for idx in actual_value_indexes if idx < len(words_with_info)]
+        value_boxes = [(w["x0"], w["y0"], w["x1"], w["y1"]) for w in value_word_infos]
+        value_merged_box = merge_bounding_boxes(value_boxes)
+        value_page = value_word_infos[0]["page"] if value_word_infos else 0
+        
+        if label not in results:
+            results[label] = {
+                "key_start_index": match["start_index"],
+                "key_end_index": match["start_index"] + actual_key_length,
+                "key_text": match["raw_key"],
+                "value_start_index": start_idx,
+                "value_end_index": min(start_idx + len(actual_value_indexes), end_idx),
+                "value_indexes": actual_value_indexes,
+                "raw_value": " ".join(value_words),
+                "cleaned_value": cleaned_value,
+                "key_coordinates": {
+                    "x": key_merged_box[0] if key_merged_box else 0,
+                    "y": key_merged_box[1] if key_merged_box else 0,
+                    "width": key_merged_box[2] - key_merged_box[0] if key_merged_box else 0,
+                    "height": key_merged_box[3] - key_merged_box[1] if key_merged_box else 0,
+                    "page": key_page + 1
+                },
+                "value_coordinates": {
+                    "x": value_merged_box[0] if value_merged_box else 0,
+                    "y": value_merged_box[1] if value_merged_box else 0,
+                    "width": value_merged_box[2] - value_merged_box[0] if value_merged_box else 0,
+                    "height": value_merged_box[3] - value_merged_box[1] if value_merged_box else 0,
+                    "page": value_page + 1
+                }
             }
             
-            logger.info(f"Completed processing {file_path} - Success rate: {result['extraction_summary']['success_rate']}")
-            return result
-            
-        except Exception as e:
-            logger.error(f"Error processing file {file_path}: {e}")
-            logger.error(traceback.format_exc())
-            result["processing_status"] = "failed"
-            result["error"] = str(e)
-            return result
+            if field_type == "split_text" and label == "receipt_name" and 'value_parts' in locals():
+                results[label]["value_parts"] = value_parts
     
-    def process_file_batch(self, file_path: str, output_dir: str = "results") -> Dict:
-        """
-        Process a single PDF/image file or all files in a directory
+    return results
+
+# Bounding boxes functions
+def draw_bounding_boxes_on_document(file_path, entity_details, file_type="pdf", field_colors=None):
+    """Draw bounding boxes for all header fields on the document pages"""
+    annotated_images = []
+    
+    if field_colors is None:
+        field_colors = DEFAULT_FIELD_COLORS
+    
+    if file_type == "pdf":
+        doc = fitz.open(file_path)
         
-        Args:
-            file_path: Path to a file or directory containing files
-            output_dir: Directory to save results
+        entities_by_page = {}
+        for label, info in entity_details.items():
+            key_coords = info.get("key_coordinates", {})
             
-        Returns:
-            Dictionary with processing results for all files
-        """
-        # Create output directory if it doesn't exist
-        os.makedirs(output_dir, exist_ok=True)
+            if key_coords.get("page") is not None:
+                page_num = key_coords["page"] - 1
+                if page_num not in entities_by_page:
+                    entities_by_page[page_num] = []
+                entities_by_page[page_num].append({
+                    "label": label,
+                    "key_coords": key_coords,
+                    "value_coords": info.get("value_coordinates", {}),
+                    "value_parts": info.get("value_parts", [])
+                })
         
-        # Determine files to process
-        if os.path.isdir(file_path):
-            # Process all PDF and image files in the directory
-            file_extensions = ['*.pdf', '*.jpg', '*.jpeg', '*.png', '*.bmp', '*.tiff', '*.gif']
-            file_list = []
-            for ext in file_extensions:
-                file_list.extend(glob.glob(os.path.join(file_path, ext)))
-            file_list.sort()  # Process in sorted order
-        elif os.path.isfile(file_path) and (file_path.lower().endswith('.pdf') or is_image_file(file_path)):
-            file_list = [file_path]
-        else:
-            error_msg = f"Invalid path: {file_path} is neither a directory nor a supported file (PDF or image)"
-            logger.error(error_msg)
-            return self._create_batch_result(error=error_msg)
-        
-        if not file_list:
-            warning_msg = f"No supported files found at {file_path}"
-            logger.warning(warning_msg)
-            return self._create_batch_result()
-        
-        logger.info(f"Found {len(file_list)} files to process")
-        
-        # Initialize batch results
-        batch_results = self._create_batch_result(total_files=len(file_list))
-        
-        # Process each file
-        for i, file_path in enumerate(file_list, 1):
+        for page_num in range(len(doc)):
+            page = doc.load_page(page_num)
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+            img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+            draw = ImageDraw.Draw(img)
+            
             try:
-                logger.info(f"Processing file {i}/{len(file_list)}: {os.path.basename(file_path)}")
-                
-                result = self.process_single_file(file_path)
-                filename = os.path.splitext(os.path.basename(file_path))[0]
-                batch_results['files'][filename] = result
-                
-                if result["processing_status"] == "completed":
-                    batch_results['successful_files'] += 1
-                else:
-                    batch_results['failed_files'] += 1
-                
-                # Save individual result
-                individual_result_path = os.path.join(output_dir, f"{filename}_extraction.json")
-                with open(individual_result_path, 'w', encoding='utf-8') as f:
-                    json.dump(result, f, indent=2, ensure_ascii=False)
-                
-            except Exception as e:
-                logger.error(f"Failed to process {file_path}: {e}")
-                batch_results['failed_files'] += 1
-                filename = os.path.splitext(os.path.basename(file_path))[0]
-                batch_results['files'][filename] = {
-                    "source_file": os.path.basename(file_path),
-                    "processing_status": "failed",
-                    "error": str(e)
-                }
-        
-        # Save batch results
-        batch_result_path = os.path.join(output_dir, "batch_results.json")
-        with open(batch_result_path, 'w', encoding='utf-8') as f:
-            json.dump(batch_results, f, indent=2, ensure_ascii=False)
-        
-        # Create summary reports
-        self.create_summary_reports(batch_results, output_dir)
-        
-        logger.info(f"Batch processing complete. Results saved to {output_dir}")
-        return batch_results
-    
-    def _create_batch_result(self, total_files=0, error=None):
-        """Create a standardized batch result structure"""
-        return {
-            'processing_timestamp': datetime.now().isoformat(),
-            'template_name': self.template_name,
-            'total_files': total_files,
-            'successful_files': 0,
-            'failed_files': 0,
-            'files': {},
-            'error': error
-        }
-    
-    def create_summary_reports(self, batch_results: Dict, output_dir: str):
-        """
-        Create comprehensive summary reports
-        
-        Args:
-            batch_results: Batch processing results
-            output_dir: Output directory
-        """
-        try:
-            # Create summary data for CSV
-            summary_data = []
-            detailed_data = []
+                font = ImageFont.truetype("arial.ttf", 16)
+                label_font = ImageFont.truetype("arial.ttf", 14)
+            except:
+                font = ImageFont.load_default()
+                label_font = ImageFont.load_default()
             
-            for filename, file_result in batch_results['files'].items():
-                if file_result["processing_status"] == "completed":
-                    extraction_summary = file_result.get('extraction_summary', {})
-                    summary_data.append({
-                        'filename': filename,
-                        'template_name': file_result['template_name'],
-                        'processing_status': 'Success',
-                        'total_fields': extraction_summary.get('total_fields', 0),
-                        'successful_extractions': extraction_summary.get('successful_extractions', 0),
-                        'failed_extractions': extraction_summary.get('failed_extractions', 0),
-                        'success_rate': extraction_summary.get('success_rate', '0%'),
-                        'extraction_timestamp': file_result.get('extraction_timestamp', '')
-                    })
+            if page_num in entities_by_page:
+                for entity in entities_by_page[page_num]:
+                    label = entity["label"]
+                    key_coords = entity["key_coords"]
+                    value_coords = entity["value_coords"]
+                    value_parts = entity["value_parts"]
                     
-                    # Create detailed data for each field
-                    for field_name, field_value in file_result.get('extracted_data', {}).items():
-                        detailed_data.append({
-                            'filename': filename,
-                            'field_name': field_name,
-                            'extracted_value': field_value,
-                            'extraction_status': 'Success' if field_value else 'Failed'
-                        })
-                else:
-                    summary_data.append({
-                        'filename': filename,
-                        'template_name': file_result.get('template_name', 'Unknown'),
-                        'processing_status': 'Failed',
-                        'total_fields': 0,
-                        'successful_extractions': 0,
-                        'failed_extractions': 0,
-                        'success_rate': '0%',
-                        'error': file_result.get('error', 'Unknown error'),
-                        'extraction_timestamp': ''
-                    })
+                    color = field_colors.get(label, (255, 0, 0))
+                    
+                    if key_coords and key_coords.get("width", 0) > 0 and key_coords.get("height", 0) > 0:
+                        x0 = key_coords["x"] * 2
+                        y0 = key_coords["y"] * 2
+                        width = key_coords["width"] * 2
+                        height = key_coords["height"] * 2
+                        
+                        draw.rectangle([x0, y0, x0 + width, y0 + height], outline=color, width=3)
+                        
+                        label_text = label.replace("_", " ").title()
+                        text_bbox = draw.textbbox((0, 0), label_text, font=label_font)
+                        text_width = text_bbox[2] - text_bbox[0]
+                        text_height = text_bbox[3] - text_bbox[1]
+                        
+                        draw.rectangle(
+                            [x0, y0 - text_height - 4, x0 + text_width + 8, y0 - 4],
+                            fill=color
+                        )
+                        
+                        draw.text((x0 + 4, y0 - text_height - 4), label_text, fill="white", font=label_font)
+                    
+                    if value_parts:
+                        for part in value_parts:
+                            part_coords = part["coordinates"]
+                            if part_coords and part_coords.get("width", 0) > 0 and part_coords.get("height", 0) > 0:
+                                vx0 = part_coords["x"] * 2
+                                vy0 = part_coords["y"] * 2
+                                vwidth = part_coords["width"] * 2
+                                vheight = part_coords["height"] * 2
+                                
+                                draw.rectangle([vx0, vy0, vx0 + vwidth, vy0 + vheight], outline=color, width=2)
+                                
+                                part_text = part["text"]
+                                if part_text:
+                                    part_bbox = draw.textbbox((0, 0), part_text[:50], font=font)
+                                    part_text_width = part_bbox[2] - part_bbox[0]
+                                    part_text_height = part_bbox[3] - part_bbox[1]
+                                    
+                                    draw.rectangle(
+                                        [vx0, vy0 + vheight, vx0 + part_text_width + 8, vy0 + vheight + part_text_height + 4],
+                                        fill=(200, 200, 200)
+                                    )
+                                    
+                                    draw.text((vx0 + 4, vy0 + vheight + 2), part_text[:50], fill="black", font=font)
+                    elif value_coords and value_coords.get("width", 0) > 0 and value_coords.get("height", 0) > 0:
+                        vx0 = value_coords["x"] * 2
+                        vy0 = value_coords["y"] * 2
+                        vwidth = value_coords["width"] * 2
+                        vheight = value_coords["height"] * 2
+                        
+                        draw.rectangle([vx0, vy0, vx0 + vwidth, vy0 + vheight], outline=color, width=2)
+                        
+                        value_text = entity_details[label]["cleaned_value"]
+                        if value_text:
+                            value_bbox = draw.textbbox((0, 0), value_text[:50], font=font)
+                            value_text_width = value_bbox[2] - value_bbox[0]
+                            value_text_height = value_bbox[3] - value_bbox[1]
+                            
+                            draw.rectangle(
+                                [vx0, vy0 + vheight, vx0 + value_text_width + 8, vy0 + vheight + value_text_height + 4],
+                                fill=(200, 200, 200)
+                            )
+                            
+                            draw.text((vx0 + 4, vy0 + vheight + 2), value_text[:50], fill="black", font=font)
             
-            # Save summary CSV
-            if summary_data:
-                df_summary = pd.DataFrame(summary_data)
-                summary_csv_path = os.path.join(output_dir, "processing_summary.csv")
-                df_summary.to_csv(summary_csv_path, index=False)
-                logger.info(f"Summary report created: {summary_csv_path}")
-            
-            # Save detailed CSV
-            if detailed_data:
-                df_detailed = pd.DataFrame(detailed_data)
-                detailed_csv_path = os.path.join(output_dir, "detailed_extractions.csv")
-                df_detailed.to_csv(detailed_csv_path, index=False)
-                logger.info(f"Detailed report created: {detailed_csv_path}")
-                
-        except Exception as e:
-            logger.error(f"Error creating summary reports: {e}")
+            annotated_images.append(img)
+        
+        doc.close()
     
-    def display_extracted_data(self, results: Dict):
-        """
-        Display extracted data in a readable format
+    elif file_type == "image":
+        img = Image.open(file_path).convert("RGB")
+        draw = ImageDraw.Draw(img)
         
-        Args:
-            results: Processing results dictionary
-        """
-        print("\n" + "="*80)
-        print("EXTRACTED DATA SUMMARY")
-        print("="*80)
+        try:
+            font = ImageFont.truetype("arial.ttf", 16)
+            label_font = ImageFont.truetype("arial.ttf", 14)
+        except:
+            font = ImageFont.load_default()
+            label_font = ImageFont.load_default()
         
-        print(f"Template: {results['template_name']}")
-        print(f"Processing Time: {results['processing_timestamp']}")
-        print(f"Total Files: {results['total_files']}")
-        print(f"Successful: {results['successful_files']}")
-        print(f"Failed: {results['failed_files']}")
-        
-        for filename, file_result in results['files'].items():
-            print(f"\n{'='*60}")
-            print(f"File: {filename}")
-            print(f"Status: {file_result.get('processing_status', 'Unknown')}")
+        for label, info in entity_details.items():
+            key_coords = info.get("key_coordinates", {})
+            value_coords = info.get("value_coordinates", {})
+            value_parts = info.get("value_parts", [])
             
-            if file_result.get("processing_status") == "completed":
-                extraction_summary = file_result.get('extraction_summary', {})
-                print(f"Success Rate: {extraction_summary.get('success_rate', '0%')}")
-                print("-" * 60)
+            color = field_colors.get(label, (255, 0, 0))
+            
+            if key_coords and key_coords.get("width", 0) > 0 and key_coords.get("height", 0) > 0:
+                x0 = key_coords["x"]
+                y0 = key_coords["y"]
+                width = key_coords["width"]
+                height = key_coords["height"]
                 
-                print("\nExtracted Fields:")
-                for field_name, value in file_result.get('extracted_data', {}).items():
-                    display_name = field_name.replace('_', ' ').title()
-                    status = "✓" if value else "✗"
-                    display_value = value[:100] + "..." if len(str(value)) > 100 else value
-                    print(f"  {status} {display_name}: {display_value}")
-            else:
-                print(f"Error: {file_result.get('error', 'Unknown error')}")
+                draw.rectangle([x0, y0, x0 + width, y0 + height], outline=color, width=3)
+                
+                label_text = label.replace("_", " ").title()
+                text_bbox = draw.textbbox((0, 0), label_text, font=label_font)
+                text_width = text_bbox[2] - text_bbox[0]
+                text_height = text_bbox[3] - text_bbox[1]
+                
+                draw.rectangle(
+                    [x0, y0 - text_height - 4, x0 + text_width + 8, y0 - 4],
+                    fill=color
+                )
+                
+                draw.text((x0 + 4, y0 - text_height - 4), label_text, fill="white", font=label_font)
             
-            print("-" * 60)
+            if value_parts:
+                for part in value_parts:
+                    part_coords = part["coordinates"]
+                    if part_coords and part_coords.get("width", 0) > 0 and part_coords.get("height", 0) > 0:
+                        vx0 = part_coords["x"]
+                        vy0 = part_coords["y"]
+                        vwidth = part_coords["width"]
+                        vheight = part_coords["height"]
+                        
+                        draw.rectangle([vx0, vy0, vx0 + vwidth, vy0 + vheight], outline=color, width=2)
+                        
+                        part_text = part["text"]
+                        if part_text:
+                            part_bbox = draw.textbbox((0, 0), part_text[:50], font=font)
+                            part_text_width = part_bbox[2] - part_bbox[0]
+                            part_text_height = part_bbox[3] - part_bbox[1]
+                            
+                            draw.rectangle(
+                                [vx0, vy0 + vheight, vx0 + part_text_width + 8, vy0 + vheight + part_text_height + 4],
+                                fill=(200, 200, 200)
+                            )
+                            
+                            draw.text((vx0 + 4, vy0 + vheight + 2), part_text[:50], fill="black", font=font)
+            elif value_coords and value_coords.get("width", 0) > 0 and value_coords.get("height", 0) > 0:
+                vx0 = value_coords["x"]
+                vy0 = value_coords["y"]
+                vwidth = value_coords["width"]
+                vheight = value_coords["height"]
+                
+                draw.rectangle([vx0, vy0, vx0 + vwidth, vy0 + vheight], outline=color, width=2)
+                
+                value_text = info["cleaned_value"]
+                if value_text:
+                    value_bbox = draw.textbbox((0, 0), value_text[:50], font=font)
+                    value_text_width = value_bbox[2] - value_bbox[0]
+                    value_text_height = value_bbox[3] - value_bbox[1]
+                    
+                    draw.rectangle(
+                        [vx0, vy0 + vheight, vx0 + value_text_width + 8, vy0 + vheight + value_text_height + 4],
+                        fill=(200, 200, 200)
+                    )
+                    
+                    draw.text((vx0 + 4, vy0 + vheight + 2), value_text[:50], fill="black", font=font)
+        
+        annotated_images.append(img)
+    
+    return annotated_images
+
+# Statistics functions
+def generate_entity_statistics(entities, indexed_words):
+    """Generate statistics about found entities"""
+    total_words = len(indexed_words)
+    
+    stats = {
+        "total_words": total_words,
+        "total_entities_found": len(entities),
+        "entities_coverage": {},
+        "word_coverage": {
+            "covered_words": 0,
+            "uncovered_words": total_words,
+            "coverage_percentage": 0.0
+        }
+    }
+    
+    covered_indexes = set()
+    
+    for label, entity_info in entities.items():
+        key_span = entity_info["key_end_index"] - entity_info["key_start_index"]
+        value_span = len(entity_info["value_indexes"])
+        total_span = key_span + value_span
+        
+        stats["entities_coverage"][label] = {
+            "key_word_count": key_span,
+            "value_word_count": value_span,
+            "total_word_count": total_span,
+            "key_indexes": list(range(entity_info["key_start_index"], entity_info["key_end_index"])),
+            "value_indexes": entity_info["value_indexes"]
+        }
+        
+        covered_indexes.update(range(entity_info["key_start_index"], entity_info["key_end_index"]))
+        covered_indexes.update(entity_info["value_indexes"])
+    
+    stats["word_coverage"]["covered_words"] = len(covered_indexes)
+    stats["word_coverage"]["uncovered_words"] = total_words - len(covered_indexes)
+    stats["word_coverage"]["coverage_percentage"] = (len(covered_indexes) / total_words) * 100 if total_words > 0 else 0
+    
+    return stats
+
+# Main processing function
+def process_document(file_path, file_type="pdf", head_keys=None, field_types=None):
+    """Main function to process document and extract all entities"""
+    if head_keys is None:
+        head_keys = DEFAULT_HEAD_KEYS
+    
+    if field_types is None:
+        field_types = DEFAULT_FIELD_TYPES
+    
+    words_with_coords = extract_text_with_coordinates(file_path, file_type)
+    indexed_words = tokenize_with_index(words_with_coords)
+    
+    key_matches = find_entity_boundaries(indexed_words, head_keys)
+    
+    entities = extract_entity_values(indexed_words, key_matches, field_types)
+    
+    stats = generate_entity_statistics(entities, indexed_words)
+    
+    result = {
+        "extracted_entities": {label: info["cleaned_value"] for label, info in entities.items()},
+        "entity_details": entities,
+        "statistics": stats,
+        "raw_text_preview": " ".join([w_info["word"] for _, w_info in indexed_words[:50]]) + "..." if len(indexed_words) > 50 else " ".join([w_info["word"] for _, w_info in indexed_words])
+    }
+    
+    return result
